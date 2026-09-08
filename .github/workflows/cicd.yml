@@ -1,120 +1,189 @@
-name: CICD Pipeline 
+name: CICD Pipeline
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
+
+  # ============================================================
+  # 1. COMPILE
+  # ============================================================
   compile:
     runs-on: self-hosted
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
-        cache: maven
-    - name: Build with Maven
-      run: mvn compile
-      
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build with Maven
+        run: mvn compile
+
+
+  # ============================================================
+  # 2. SECURITY CHECK
+  # ============================================================
   security-check:
     runs-on: self-hosted
     needs: compile
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Trivy Installation
-      run: |
-        sudo apt-get install -y wget apt-transport-https gnupg lsb-release
-        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-        echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
-        sudo apt-get update -y
-        sudo apt-get install -y trivy
+      - uses: actions/checkout@v4
 
-    - name: Trivy FS Scan
-      run: trivy fs --format table -o fs-report.json .
+      # ---------------- Trivy ----------------
+      - name: Trivy Installation
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
 
-    - name: Gitleaks Installation
-      run: sudo apt install gitleaks -y
-    - name: Gitleaks Code Scan
-      run: gitleaks detect source . -r gitleaks-report.json -f json
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | sudo apt-key add -
+
+          echo deb https://aquasecurity.github.io/trivy-repo/deb \
+            $(lsb_release -sc) main \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+
+          sudo apt-get update -y
+          sudo apt-get install -y trivy
+
+      - name: Trivy FS Scan
+        run: |
+          trivy fs \
+            --format table \
+            -o fs-report.json \
+            .
+
+      # ---------------- Gitleaks ----------------
+      - name: Gitleaks Installation
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y gitleaks
+
+      - name: Gitleaks Code Scan
+        run: |
+          gitleaks detect \
+            --source . \
+            --report-path gitleaks-report.json \
+            --report-format json
+
+
+  # ============================================================
+  # 3. UNIT TEST
+  # ============================================================
   test:
     runs-on: self-hosted
     needs: security-check
+
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
-        cache: maven
-    - name: Unit Test Cases
-      run: mvn test
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Unit Test Cases
+        run: mvn test
+
+
+  # ============================================================
+  # 4. BUILD + SONARQUBE
+  # ============================================================
   build_project_and_sonar_scan:
     runs-on: self-hosted
     needs: test
+
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
-        cache: maven
-    - name: Build Project
-      run: mvn package
-    - name: Upload JAR artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: app-jar
-        path: target/*.jar 
-        
-    # - uses: actions/checkout@v4
-    #   with:
-    #     # Disabling shallow clones is recommended for improving the relevancy of reporting
-    #     fetch-depth: 0
-    # - name: SonarQube Scan
-    #   uses: SonarSource/sonarqube-scan-action@v8.2.1 # Ex: v4.1.0, See the latest version at https://github.com/marketplace/actions/official-sonarqube-scan
-    #   env:
-    #     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-    #     SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
-        
-    # - name: SonarQube Quality Gate check
-    #   id: sonarqube-quality-gate-check
-    #   uses: sonarsource/sonarqube-quality-gate-action@master
-    #   with:
-    #     pollingTimeoutSec: 600
-    #   env:
-    #       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-    #       SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build Project
+        run: |
+          mvn clean package -DskipTests
+
+      # ---------------- SonarQube ----------------
+      - name: SonarQube Analysis
+        run: |
+          mvn sonar:sonar \
+            -Dsonar.host.url="${{ vars.SONAR_HOST_URL }}" \
+            -Dsonar.token="${{ secrets.SONAR_TOKEN }}" \
+            -Dsonar.projectKey="GC-Bank" \
+            -Dsonar.qualitygate.wait=true
+
+      # ---------------- Upload JAR ----------------
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/*.jar
+
+
+  # ============================================================
+  # 5. DOCKER BUILD + TRIVY + ACR PUSH
+  # ============================================================
   build_docker_image_and_push:
     runs-on: self-hosted
     needs: build_project_and_sonar_scan
+
     steps:
-    - uses: actions/checkout@v4
-    - name: Build Docker image
-      run: |
-        docker build -t myacr1234.azurecr.io/bankapp:${{ github.sha }} .
+      - uses: actions/checkout@v4
 
-    - name: Trivy image scan
-      run: |
-        trivy image \
-          --severity HIGH,CRITICAL \
-          --exit-code 1 \
-          myacr1234.azurecr.io/bankapp:${{ github.sha }}
+      # Download JAR created in previous job
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: app
 
-    - name: Login to Azure
-      uses: azure/login@v2
-      with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
+      # Optional - verify JAR exists
+      - name: Verify JAR
+        run: |
+          ls -lah app
 
-    - name: Login to ACR
-      run: |
-        az acr login --name myacr1234
+      # ---------------- Docker Build ----------------
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t myacr1234.azurecr.io/bankapp:${{ github.sha }} \
+            .
 
-    - name: Push image to ACR
-      run: |
-        docker push myacr1234.azurecr.io/bankapp:${{ github.sha }}
+      # ---------------- Trivy Image Scan ----------------
+      - name: Trivy image scan
+        run: |
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            myacr1234.azurecr.io/bankapp:${{ github.sha }}
+
+      # ---------------- Azure Login ----------------
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # ---------------- ACR Login ----------------
+      - name: Login to ACR
+        run: |
+          az acr login --name myacr1234
+
+      # ---------------- Push Image ----------------
+      - name: Push image to ACR
+        run: |
+          docker push \
+            myacr1234.azurecr.io/bankapp:${{ github.sha }}
